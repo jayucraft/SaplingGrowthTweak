@@ -1,12 +1,15 @@
 ﻿using System;
 using System.Collections.Generic;
+using System.Linq;
+using System.Reflection;
 using System.Reflection.Emit;
 using HarmonyLib;
 using Vintagestory.API.Common;
 using Vintagestory.API.Server;
+using Vintagestory.API.Util;
 using Vintagestory.GameContent;
 
-[assembly: ModInfo(name: "SaplingGrowthTweak", modID: "saplinggrowthtweak", Side = "Universal", Version = "1.0.0", Authors = new string[] { "jayugg" },
+[assembly: ModInfo(name: "SaplingGrowthTweak", modID: "saplinggrowthtweak", Side = "Universal", Version = "1.0.1", Authors = new string[] { "jayugg" },
     Description = "Edit sapling growth minimum temperature")]
 
 namespace SaplingGrowthTweak
@@ -40,7 +43,6 @@ namespace SaplingGrowthTweak
             if (Harmony.HasAnyPatches(Mod.Info.ModID)) return;
             harmony = new Harmony(Mod.Info.ModID);
             harmony.PatchAll();
-            Logger.Notification($"Correctly loaded temperature from config: {config?.Temperature}");
         }
         
         public override void Dispose()
@@ -50,24 +52,54 @@ namespace SaplingGrowthTweak
         
         [HarmonyPatch(typeof(BlockEntitySapling), "CheckGrow", typeof(float))]
         [HarmonyTranspiler]
-        static IEnumerable<CodeInstruction> CheckGrowTranspiler(IEnumerable<CodeInstruction> instructions)
+        static IEnumerable<CodeInstruction> CheckGrowTranspiler(IEnumerable<CodeInstruction> instructions, ILGenerator il)
         {
             var codes = new List<CodeInstruction>(instructions);
-            foreach (var instruction in codes)
+            MethodInfo helperMethod = typeof(SaplingGrowthTweakModSystem).GetMethod(nameof(AdjustTemperatureBasedOnConfig), BindingFlags.Static | BindingFlags.Public);
+
+            // Define a local variable to store the float return value from the helper method
+            LocalBuilder tempVar = il.DeclareLocal(typeof(float));
+
+            for (int i = 0; i < codes.Count; i++)
             {
-                if (instruction.opcode == OpCodes.Ldc_R4 && Math.Abs((float)instruction.operand - 5.0f) < 0.0001f)
+                if (codes[i].opcode == OpCodes.Ldc_R4 && Math.Abs((float)codes[i].operand - 5.0f) < 0.0001f)
                 {
-                    Logger.Notification($"Transpiling CheckGrow: {config.Temperature}");
-                    instruction.operand = config.Temperature;
+                    Logger.Notification($"Transpiling CheckGrow");
+                    
+                    // Insert instructions to call the helper method and store its return value
+                    codes.Insert(i, new CodeInstruction(OpCodes.Ldarg_0)); // Load `this` onto the evaluation stack
+                    codes.Insert(i + 1, new CodeInstruction(OpCodes.Call, helperMethod)); // Call the helper method
+                    codes.Insert(i + 2, new CodeInstruction(OpCodes.Stloc, tempVar.LocalIndex)); // Store the return value in the local variable
+
+                    // Replace the Ldc_R4 instruction with one that loads the local variable
+                    codes[i + 3] = new CodeInstruction(OpCodes.Ldloc, tempVar.LocalIndex);
+
                     break;
                 }
             }
             return codes;
         }
+        
+        public static float AdjustTemperatureBasedOnConfig(BlockEntitySapling instance)
+        {
+            var code = instance.Block.Code;
+            var mostSpecificMatch = config.TemperaturePerSaplingType
+                .Where(keyVal => WildcardUtil.Match(keyVal.Key, code.ToString()))
+                .OrderByDescending(keyVal => keyVal.Key.Length)
+                .FirstOrDefault()
+                .Value;
+            Logger.Warning($"Adjusting temperature for {code} growth to: {mostSpecificMatch}");
+            return mostSpecificMatch;
+        }
     }
     
     public class TweakConfig
     {
-        public float Temperature { get; set; } = -100;
+        public Dictionary<string, float> TemperaturePerSaplingType { get; set; } = new Dictionary<string, float>()
+        {
+            { "@(.*)", -100 },
+            { "@(.*)pine(.*)", -101 },
+            { "@(.*)birch(.*)", -102 },
+        };
     }
 }
